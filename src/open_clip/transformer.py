@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple
+from einops import rearrange
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -80,6 +81,39 @@ class PatchDropout(nn.Module):
 
         if self.exclude_first_token:
             x = torch.cat((cls_tokens, x), dim=1)
+
+        return x
+
+
+class MosaicMixer(nn.Module):
+    def __init__(self, patch_drop):
+        self.patch_drop = patch_drop
+        self.num_inst = int(1 / (1 - patch_drop))
+    
+    def mix_image(self, x):
+        if self.patch_drop == 0.:
+            return x, None
+
+        # exclude [cls]
+        x = x[:, 1:]
+
+        B, L, C = x.shape
+        # batch shuffle
+        idx_shuffle = torch.randperm(B, device=x.device)
+        idx_unshuffle = torch.argsort(idx_shuffle)
+        x = x[idx_shuffle]
+
+        # mix
+        x = rearrange(x, "(k b) l c -> b (k l) c", k = self.num_inst)
+
+        return x, idx_unshuffle
+    
+    def demix_image(self, x, idx_unshuffle):
+        if self.patch_drop == 0.:
+            return x
+
+        x = x[idx_unshuffle]
+        x = rearrange(x, "b (k l) c -> (k b) l c", k = self.num_inst)
 
         return x
 
@@ -368,6 +402,7 @@ class VisionTransformer(nn.Module):
 
         # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
         self.patch_dropout = PatchDropout(patch_dropout) if patch_dropout > 0. else nn.Identity()
+        self.mosaic_mixer = MosaicMixer(patch_dropout)
 
         self.ln_pre = norm_layer(width)
         self.transformer = Transformer(
@@ -480,9 +515,16 @@ class VisionTransformer(nn.Module):
         x = self.patch_dropout(x)
         x = self.ln_pre(x)
 
+        # FIXME: check mixer before or after layernorm
+        if self.training:
+            x, idx_unshuffle = self.mosaic_mixer.mix_image(x)
+
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+
+        if self.training:
+            x = self.mosaic_mixer.demix_image(x, idx_unshuffle)
 
         if self.attn_pool is not None:
             x = self.attn_pool(x)
